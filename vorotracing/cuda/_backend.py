@@ -1,0 +1,252 @@
+"""
+Copied/based on https://github.com/nerfstudio-project/gsplat/blob/65042cc501d1cdbefaf1d6f61a9a47575eec8c71/gsplat/cuda/_backend.py
+
+Trigger compiling (for debugging):
+
+VERBOSE=1 TORCH_CUDA_ARCH_LIST="8.9" python -c "from vorotracing.cuda._backend import _C"
+"""
+
+import json
+import os
+import time
+from subprocess import DEVNULL, call
+
+import torch
+from packaging import version
+from rich.console import Console
+from torch.utils.cpp_extension import _find_cuda_home  # <--- For robust CUDA detection
+from torch.utils.cpp_extension import (
+    _TORCH_PATH,
+    _get_build_directory,
+    _import_module_from_library,
+    _jit_compile,
+)
+
+PATH = os.path.dirname(os.path.abspath(__file__))
+VERBOSE = os.getenv("VERBOSE", "0") == "1"
+MAX_JOBS = os.getenv("MAX_JOBS")
+USE_PRECOMPILED_HEADERS = os.getenv("USE_PRECOMPILED_HEADERS", "0") == "1"
+need_to_unset_max_jobs = False
+if not MAX_JOBS:
+    need_to_unset_max_jobs = True
+    os.environ["MAX_JOBS"] = "10"
+
+DEBUG_CUDA = os.getenv("DEBUG_CUDA", "0") == "1"
+PROFILE_CUDA = os.getenv("PROFILE_CUDA", "0") == "1"
+
+# torch has bugs on precompiled headers before 2.2, see:
+# https://github.com/nerfstudio-project/gsplat/pull/583#issuecomment-2732597080
+if version.parse(torch.__version__) < version.parse("2.2") and USE_PRECOMPILED_HEADERS:
+    Console().print(
+        "[yellow]gsplat: Precompiled headers are enabled but torch version is lower than 2.2. Disabling it.[/yellow]"
+    )
+    USE_PRECOMPILED_HEADERS = False
+
+MODERN_CUDA_CARDS = (
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
+)
+
+
+def load_extension(
+    name,
+    sources,
+    extra_cflags=None,
+    extra_cuda_cflags=None,
+    extra_ldflags=None,
+    extra_include_paths=None,
+    build_directory=None,
+    verbose=False,
+):
+    """Load a JIT compiled extension."""
+    # Make sure the build directory exists.
+    if build_directory:
+        os.makedirs(build_directory, exist_ok=True)
+
+    # If the JIT build happens concurrently in multiple processes,
+    # race conditions can occur when removing the lock file at:
+    # https://github.com/pytorch/pytorch/blob/e3513fb2af7951ddf725d8c5b6f6d962a053c9da/torch/utils/cpp_extension.py#L1736
+    # But it's ok so we catch this exception and ignore it.
+    try:
+        if USE_PRECOMPILED_HEADERS:
+            from torch.utils.cpp_extension import (
+                _check_and_build_extension_h_precompiler_headers,
+            )
+
+            # Using PreCompiled Header('torch/extension.h') to reduce compile time.
+            # remove: remove_extension_h_precompiler_headers()
+            _check_and_build_extension_h_precompiler_headers(
+                extra_cflags, extra_include_paths
+            )
+            head_file = os.path.join(_TORCH_PATH, "include", "torch", "extension.h")
+            extra_cflags += ["-include", head_file, "-Winvalid-pch"]
+
+        try:
+            compiled = _jit_compile(
+                name,
+                sources,
+                extra_cflags,
+                extra_cuda_cflags,
+                extra_ldflags,
+                extra_include_paths,
+                build_directory,
+                verbose,
+                with_cuda=None,
+                is_python_module=True,
+                is_standalone=False,
+                keep_intermediates=True,
+            )
+        except (
+            TypeError
+        ) as e:  # torch>=2.7.0 has added arguments to _jit_compile to support SYCL.
+            # Narrow the scope of catch: only retry if it's due to unexpected argument(s)
+            if "_jit_compile() missing" in str(e):
+                compiled = _jit_compile(
+                    name,
+                    sources,
+                    extra_cflags,
+                    extra_cuda_cflags,
+                    None,  # SYCL fallback
+                    extra_ldflags,
+                    extra_include_paths,
+                    build_directory,
+                    verbose,
+                    with_cuda=None,
+                    with_sycl=None,
+                    is_python_module=True,
+                    is_standalone=False,
+                    keep_intermediates=True,
+                )
+            else:
+                raise e
+
+        return compiled
+    except OSError:
+        # The module should already be compiled if we get OSError
+        return _import_module_from_library(name, build_directory, True)
+
+
+def cuda_toolkit_available():
+    """
+    Check more robustly if the CUDA toolkit is available.
+    1. Attempt to locate `CUDA_HOME` using PyTorch’s internal method.
+    2. Check if nvcc is present in that location.
+    """
+    cuda_home = _find_cuda_home()  # This tries various heuristics
+    if not cuda_home:
+        return False
+
+    # If we have a cuda_home, check if nvcc exists there:
+    nvcc_path = os.path.join(cuda_home, "bin", "nvcc")
+    if not os.path.isfile(nvcc_path):
+        # Maybe still on PATH, try calling "nvcc" directly:
+        try:
+            call(["nvcc"], stdout=DEVNULL, stderr=DEVNULL)
+            return True
+        except FileNotFoundError:
+            return False
+    return True
+
+
+def cuda_toolkit_version():
+    """Get the CUDA toolkit version if we found CUDA home."""
+    cuda_home = _find_cuda_home()
+    if not cuda_home:
+        return None
+
+    if os.path.exists(os.path.join(cuda_home, "version.txt")):
+        with open(os.path.join(cuda_home, "version.txt")) as f:
+            cuda_version = f.read().strip().split()[-1]
+    elif os.path.exists(os.path.join(cuda_home, "version.json")):
+        with open(os.path.join(cuda_home, "version.json")) as f:
+            cuda_version = json.load(f)["cuda"]["version"]
+    else:
+        raise RuntimeError("Cannot find the CUDA version file in CUDA_HOME.")
+    return cuda_version
+
+
+_C = None
+
+try:
+    # Try to import the compiled module (via setup.py or pre-built .so)
+    from vorotracing import csrc as _C
+except ImportError:
+    # if that fails, try with JIT compilation
+    if cuda_toolkit_available():
+        name = "vorotracing_cuda"
+        build_dir = _get_build_directory(name, verbose=False)
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        repo_root = os.path.abspath(os.path.join(current_dir, "..", ".."))
+        eigen_path = os.path.join(repo_root, "external", "eigen")
+        cubql_path = os.path.join(repo_root, "external", "cubql")
+
+        extra_include_paths = [
+            os.path.join(PATH),
+            eigen_path,
+            cubql_path,
+        ]
+        # Force -O0 optimization when debugging for accurate line mappings
+        opt_level = "-O0" if (DEBUG_CUDA) else "-O3"
+        extra_cflags = [opt_level, "-Wno-attributes"]
+        if MODERN_CUDA_CARDS:
+            extra_cuda_cflags = [
+                "-Xptxas",
+                "-dlcm=ca",
+                opt_level,
+                "--extended-lambda",
+                "--maxrregcount=128",
+                "-DMODERN_CUDA_CARDS",
+            ]
+        else:
+            extra_cuda_cflags = [
+                opt_level,
+                "--extended-lambda",
+            ]
+        extra_cuda_cflags += ["-use_fast_math"]
+        extra_ldflags = ["-lcuda"]  # Link against CUDA Driver API
+        sources = [
+            os.path.join(PATH, "csrc", "tracing", "tracing_octmap.cu"),
+            os.path.join(PATH, "csrc", "utils", "nn_bvh.cu"),
+            os.path.join(PATH, "csrc", "utils", "farthest_neighbor.cu"),
+            os.path.join(PATH, "csrc", "ext.cpp"),
+        ]
+        if DEBUG_CUDA:
+            extra_cuda_cflags += ["-g", "-G"]
+            extra_cflags += ["-g"]
+            print(f"DEBUG_CUDA: {DEBUG_CUDA}")
+            Console().print(
+                "[yellow]Debug mode enabled: compiling with -O0, and full debug info for cuda-gdb.[/yellow]"
+            )
+        if PROFILE_CUDA or DEBUG_CUDA:
+            extra_cuda_cflags += ["-lineinfo"]
+
+        tic = time.time()
+        with Console().status(
+            f"[bold yellow]VoroTracing: Building CUDA extension with MAX_JOBS={os.environ['MAX_JOBS']} (This may take a few minutes the first time)",
+            spinner="bouncingBall",
+        ):
+            # Build CUDA extension. If a cached build exists, _jit_compile will load it instead of rebuilding.
+            _C = load_extension(
+                name=name,
+                sources=sources,
+                extra_cflags=extra_cflags,
+                extra_cuda_cflags=extra_cuda_cflags,
+                extra_ldflags=extra_ldflags,
+                extra_include_paths=extra_include_paths,
+                build_directory=build_dir,
+                verbose=VERBOSE,
+            )
+        toc = time.time()
+        Console().print(
+            f"[green]VoroTracing: CUDA extension has been set up successfully in {toc - tic:.2f} seconds.[/green]"
+        )
+
+    else:
+        Console().print(
+            "[yellow]VoroTracing: No CUDA toolkit found. CUDA extension will be disabled.[/yellow]"
+        )
+
+if need_to_unset_max_jobs:
+    os.environ.pop("MAX_JOBS")
+
+
+__all__ = ["_C"]
