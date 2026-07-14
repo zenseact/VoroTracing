@@ -57,7 +57,6 @@ class VoroTrainerConfig(InstantiateConfig):
     iter2downsample: dict[int, float] = field(default_factory=lambda: {0: 8, 5_000: 4})
     density_warmup_steps: int = 2_000
     white_background: bool = True
-    quantile_weight: float = 1e-4
     contribution_weight: float = 0.0
     distortion_weight: float = 0.0
 
@@ -186,21 +185,11 @@ class VoroTracingTrainer:
             rgb_batch = batch["rgbs"]
             alpha_batch = batch.get("alphas", torch.ones_like(rgb_batch[..., :1]))
 
-            if self.config.quantile_weight > 0:
-                depth_quantiles = (
-                    torch.rand(*ray_batch.shape[:-1], 2, device=self.device)
-                    .sort(dim=-1, descending=True)
-                    .values
-                )
-            else:
-                depth_quantiles = None
-
             need_contribution = (
                 self.config.contribution_weight > 0 or self.config.distortion_percell
             )
-            rgba_output, depth, contribution, _, errbox, distortion = self.model(
+            rgba_output, _, contribution, _, errbox, distortion = self.model(
                 ray_batch,
-                depth_quantiles=depth_quantiles,
                 return_contribution=need_contribution,
             )
 
@@ -216,17 +205,6 @@ class VoroTracingTrainer:
 
             color_loss = self.rgb_loss(rgb_batch, rgb_output)
             opacity_loss = ((alpha_batch - opacity) ** 2).mean()
-
-            if depth_quantiles is not None:
-                valid_depth_mask = (depth > 0).all(dim=-1)
-                quant_loss = (depth[..., 0] - depth[..., 1]).abs()
-                quant_loss = (quant_loss * valid_depth_mask).mean()
-                w_depth = self.config.quantile_weight * min(
-                    2 * step / self.config.iterations, 1
-                )
-            else:
-                quant_loss = torch.zeros((), device=self.device)
-                w_depth = 0.0
 
             if self.config.contribution_weight > 0:
                 num_rays = ray_batch.reshape(-1, 6).shape[0]
@@ -277,7 +255,6 @@ class VoroTracingTrainer:
             loss = (
                 rgb_term
                 + opacity_loss
-                + w_depth * quant_loss
                 + w_contribution * contribution_loss
                 + w_distortion * distortion_loss
             )
@@ -359,7 +336,6 @@ class VoroTracingTrainer:
                     log_dict = {
                         "train/rgb_loss": color_loss.mean(),
                         "train/opacity_loss": opacity_loss.item(),
-                        "train/quant_loss": quant_loss.item(),
                         "train/num_points": self.model.primal_points.shape[0],
                         "train/contribution_loss": contribution_loss.item(),
                         "train/contribution_weight": w_contribution,

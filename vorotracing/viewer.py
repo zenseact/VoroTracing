@@ -377,7 +377,6 @@ class VoroTracingViewer(nerfview.Viewer):
         valid = depth_map > 0
         if valid.any():
             valid_depths = depth_map[valid]
-            # Robust normalization using percentiles to suppress outliers
             lo = np.percentile(valid_depths, 2)
             hi = np.percentile(valid_depths, 98)
             normalized = np.zeros_like(depth_map)
@@ -385,7 +384,6 @@ class VoroTracingViewer(nerfview.Viewer):
         else:
             normalized = np.zeros_like(depth_map)
         rgb = cmap(normalized)[..., :3]
-        # Mark invalid pixels black
         rgb[~valid] = 0.0
         return rgb.astype(np.float32)
 
@@ -415,23 +413,21 @@ class VoroTracingViewer(nerfview.Viewer):
             rgb = rgba_output[..., :3].cpu().detach().numpy().reshape(height, width, 3)
             return rgb
 
-        elif mode == "Mean Depth":
-            N = int(self._mean_depth_samples.value)
-            thresholds = torch.linspace(1 - 1 / (2 * N), 1 / (2 * N), N, device=device)
-            thresholds = thresholds.expand(*rays.shape[:-1], N).contiguous()
-            _, depth, _, _, _ = self.model(rays, depth_quantiles=thresholds)
+        if mode == "Mean Depth":
+            n = int(self._mean_depth_samples.value)
+            thresholds = torch.linspace(1 - 1 / (2 * n), 1 / (2 * n), n, device=device)
+            thresholds = thresholds.expand(*rays.shape[:-1], n).contiguous()
+            _, depth, _, _, _, _ = self.model(rays, depth_quantiles=thresholds)
             valid = depth > 0
             mean_depth = (depth * valid).sum(-1) / valid.sum(-1).clamp(min=1)
-            # Where no sample was valid at all, mark as -1
             mean_depth[valid.sum(-1) == 0] = -1.0
             depth_np = mean_depth.cpu().numpy().reshape(height, width)
             return self._depth_to_rgb(depth_np)
 
-        else:  # "Depth at Threshold"
-            threshold = float(self._depth_threshold.value)
-            thresholds = torch.full(
-                (*rays.shape[:-1], 1), threshold, device=device, dtype=torch.float32
-            )
-            _, depth, _, _, _ = self.model(rays, depth_quantiles=thresholds)
-            depth_np = depth[..., 0].cpu().numpy().reshape(height, width)
-            return self._depth_to_rgb(depth_np)
+        threshold = float(self._depth_threshold.value)
+        thresholds = torch.full(
+            (*rays.shape[:-1], 1), threshold, device=device, dtype=torch.float32
+        )
+        _, depth, _, _, _, _ = self.model(rays, depth_quantiles=thresholds)
+        depth_np = depth[..., 0].cpu().numpy().reshape(height, width)
+        return self._depth_to_rgb(depth_np)

@@ -412,13 +412,13 @@ class VoroTracing(torch.nn.Module):
         Args:
             rays: [..., 6] (3 origins + 3 directions)
             start_point: [...,] optional
-            depth_quantiles: [..., 2] optional
+            depth_quantiles: [..., K] optional transmittance thresholds for depth output
             weight_threshold: float optional
             max_intersections: int optional
             return_contribution: bool optional
         Returns:
             rgba: [..., 4]
-            depth: [..., 2]
+            depth: [..., K] if depth_quantiles was provided, otherwise an empty tensor
             contribution: [..., 1]
             num_intersections: [..., 1]
             errbox: ErrorBox
