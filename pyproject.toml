@@ -30,6 +30,7 @@ dependencies = [
     "pybind11>=3.0.1",
     "viser>=1.0.15",
     "pandas>=2.3.3",
+    "PyYAML>=6.0.2",
     "paragram @ git+https://github.com/zenseact/paragram.git",
     "romav2 @ git+https://github.com/Parskatt/RoMaV2.git",
 ]

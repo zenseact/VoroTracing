@@ -9,7 +9,6 @@ from ._wrapper import (
     trace_octmap_infer_q8,
 )
 
-farthest_neighbor = _C.farthest_neighbor
 NNBVH = _C.NNBVH
 nearest_neighbor_bvh = _C.nearest_neighbor_bvh
 
@@ -53,7 +52,6 @@ __all__ = [
     "trace_octmap_infer_q8",
     "prefetch_octmap_adj",
     "build_voronoi_adjacency",
-    "farthest_neighbor",
     "NNBVH",
     "nearest_neighbor_bvh",
 ]

@@ -1,4 +1,3 @@
-import gc
 import os
 import time
 from dataclasses import dataclass, field
@@ -45,7 +44,6 @@ class VoroTrainerConfig(InstantiateConfig):
     rays_per_batch: int = 1_000_000
     num_init_points: int = 131_072
     num_random_init_points: int = 5_000
-    num_final_points: int = 4_194_304
     subsample_density_alpha: float = 1.0
     val_interval: int = 2500
     train_log_interval: int = 100
@@ -57,13 +55,10 @@ class VoroTrainerConfig(InstantiateConfig):
     ssim_weight: float = 0.0
 
     iter2downsample: dict[int, float] = field(default_factory=lambda: {0: 8, 5_000: 4})
-    densify_from: int = 2_000
-    densify_until: int = 11_000
-    densify_factor: float = 1.15
+    density_warmup_steps: int = 2_000
     white_background: bool = True
     quantile_weight: float = 1e-4
     contribution_weight: float = 0.0
-    contribution_ema_decay: float = 0.99
     distortion_weight: float = 0.0
 
     # Per-cell adaptive distortion (Adaptive Shells analog). Modulates the global
@@ -137,7 +132,7 @@ class VoroTracingTrainer:
 
         self._declare_optimizer(
             config=config.optimizer_config,
-            warmup=config.densify_from,
+            warmup=config.density_warmup_steps,
             max_iterations=config.iterations,
         )
 
@@ -161,9 +156,6 @@ class VoroTracingTrainer:
     def train(self):
         last_triangulation_update = 0
         triangulation_update_period = 1
-
-        iters_since_densification = 0
-        next_densification_after = 1
 
         # Track training time
         training_start_time = time.time()
@@ -240,9 +232,6 @@ class VoroTracingTrainer:
                 num_rays = ray_batch.reshape(-1, 6).shape[0]
                 contribution_loss = contribution.sum() / num_rays
                 w_contribution = self._contribution_weight(step)
-                self.model.update_contribution_ema(
-                    contribution.detach(), decay=self.config.contribution_ema_decay
-                )
             else:
                 contribution_loss = torch.zeros((), device=self.device)
                 w_contribution = 0.0
@@ -468,56 +457,6 @@ class VoroTracingTrainer:
 
                 if triangulation_update_period < 100:
                     triangulation_update_period += 2
-
-            # Densification
-            if step + 1 >= self.config.densify_from:
-                iters_since_densification += 1
-
-            if (
-                iters_since_densification == next_densification_after
-                and self.model.primal_points.shape[0]
-                < self.config.num_final_points * 0.9
-            ):
-                point_error, point_contribution = self.model.collect_error_map(
-                    self.train_dataset, self.config.white_background
-                )
-                torch.cuda.synchronize()
-                num_pruned, num_added = self.model.prune_and_densify(
-                    point_error,
-                    point_contribution,
-                    self.config.densify_factor,
-                )
-                torch.cuda.synchronize()
-                if self.config.wandb:
-                    wandb.log(
-                        {
-                            "train/num_pruned": num_pruned,
-                            "train/num_added": num_added,
-                        },
-                        step=step,
-                    )
-
-                self.model.update_triangulation(incremental=False)
-                triangulation_update_period = 1
-                gc.collect()
-
-                # Linear growth
-                iters_since_densification = 0
-                growth_budget = (
-                    self.config.num_final_points - self.config.num_init_points
-                )
-                if growth_budget > 0:
-                    next_densification_after = int(
-                        (
-                            (self.config.densify_factor - 1)
-                            * self.model.primal_points.shape[0]
-                            * (self.config.densify_until - self.config.densify_from)
-                        )
-                        / growth_budget
-                    )
-                else:
-                    next_densification_after = 500
-                next_densification_after = max(next_densification_after, 100)
 
             # Release viewer lock
             if self.config.viewer:

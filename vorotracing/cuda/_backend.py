@@ -206,7 +206,6 @@ except ImportError:
         sources = [
             os.path.join(PATH, "csrc", "tracing", "tracing_octmap.cu"),
             os.path.join(PATH, "csrc", "utils", "nn_bvh.cu"),
-            os.path.join(PATH, "csrc", "utils", "farthest_neighbor.cu"),
             os.path.join(PATH, "csrc", "ext.cpp"),
         ]
         if DEBUG_CUDA:
