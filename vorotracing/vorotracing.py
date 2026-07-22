@@ -22,10 +22,6 @@ class VoroTracingConfig:
     """Scale factor for the activation function of density."""
     up_direction: List[float] = field(default_factory=lambda: [0, 0, 0])
     """Up direction for the scene. If [0, 0, 0], use the global up direction. This is unused in the model but required if one wants to display correctly in the viewer after training."""
-    triangulation_method: Literal["fpd"] = "fpd"
-    """Adjacency method. 'fpd' builds standard Voronoi adjacency with Paragram."""
-    voronoi_warmstart: bool = False
-    """Allow warmstarting the voronoi triangulation."""
 
 
 class VoroTracing(torch.nn.Module):
@@ -44,7 +40,6 @@ class VoroTracing(torch.nn.Module):
         self.config = config
         self.device = device
         self.optimizer = None
-        self.require_full_triangulation = True
 
         assert points is not None, "points must be provided"
         assert points.shape[0] > 0, "points must have at least 1 point"
@@ -113,14 +108,8 @@ class VoroTracing(torch.nn.Module):
             self.bvh.build(self.primal_points)
         else:
             points = points.to(self.device)
-
-            if config.triangulation_method == "fpd":
-                self.primal_points = nn.Parameter(points)
-                self.update_triangulation(rebuild=False)
-            else:
-                raise ValueError(
-                    f"Invalid triangulation method: {config.triangulation_method}"
-                )
+            self.primal_points = nn.Parameter(points)
+            self.update_triangulation()
 
     @classmethod
     def from_random(
@@ -317,43 +306,19 @@ class VoroTracing(torch.nn.Module):
         self.density = optimizable_tensors["density"]
         self.att_diffuse = optimizable_tensors["att_diffuse"]
         self.att_specular = optimizable_tensors["att_specular"]
-        self.require_full_triangulation = True
 
-    def update_triangulation(self, rebuild=True, incremental=False):
+    def update_triangulation(self):
         """Update the triangulation with new point positions."""
         if not self.primal_points.isfinite().all():
             raise RuntimeError("NaN in points")
 
-        if self.config.triangulation_method == "fpd":
-            if (not self.config.voronoi_warmstart) or (
-                self.require_full_triangulation
-                or self.point_adjacency_offsets.shape[0]
-                != self.primal_points.shape[0] + 1
-            ):
-                adjacency, offsets, status = ops.build_voronoi_adjacency(
-                    self.primal_points.detach(), debug=False
-                )
-                self.require_full_triangulation = False
-            else:
-                adjacency = self.point_adjacency.detach().to(torch.int32).contiguous()
-                offsets = (
-                    self.point_adjacency_offsets.detach().to(torch.int32).contiguous()
-                )
-                adjacency, offsets, status = ops.build_voronoi_adjacency(
-                    self.primal_points.detach(),
-                    debug=False,
-                    initial_guesses=adjacency,
-                    initial_guesses_offsets=offsets,
-                )
+        adjacency, offsets, _ = ops.build_voronoi_adjacency(
+            self.primal_points.detach(), debug=False
+        )
+        self.point_adjacency = adjacency
+        self.point_adjacency_offsets = offsets
 
-            self.point_adjacency = adjacency
-            self.point_adjacency_offsets = offsets
-
-            self.bvh.build(self.primal_points)
-        else:
-            raise ValueError(
-                f"Invalid triangulation method: {self.config.triangulation_method}"
-            )
+        self.bvh.build(self.primal_points)
 
     def get_starting_point(self, rays):
         """Given rays shaped [..., 6],

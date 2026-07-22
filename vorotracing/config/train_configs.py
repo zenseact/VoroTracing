@@ -37,10 +37,8 @@ _train_configs["vorotracing-outdoor"] = VoroTrainerConfig(
     num_init_points=2_000_000,
     density_warmup_steps=2000,
     white_background=True,
-    contribution_weight=0.0,
     distortion_weight=2e-3,
     specular_reg_weight=1e-2,
-    diffuse_tv_weight=0.0,
     diffuse_mean_pull_weight=5e-3,
     experiment_name="vorotracing-outdoor",
 )

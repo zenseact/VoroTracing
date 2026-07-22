@@ -57,18 +57,9 @@ class VoroTrainerConfig(InstantiateConfig):
     iter2downsample: dict[int, float] = field(default_factory=lambda: {0: 8, 5_000: 4})
     density_warmup_steps: int = 2_000
     white_background: bool = True
-    contribution_weight: float = 0.0
     distortion_weight: float = 0.0
 
-    # Per-cell adaptive distortion (Adaptive Shells analog). Modulates the global
-    # distortion (binarization) pressure per cell by photometric confidence: confident
-    # surface cells binarize fully while fuzzy/high-frequency cells (foliage, grass)
-    # are spared and keep soft opacity for sub-cell detail.
-    distortion_percell: bool = False
-    distortion_percell_beta: float = 1.0  # larger -> gentler suppression
-    distortion_percell_decay: float = 0.95  # EMA decay for per-cell residual
     specular_reg_weight: float = 0.0
-    diffuse_tv_weight: float = 0.0
     diffuse_mean_pull_weight: float = 0.0
 
     out_dir: str = "output"
@@ -183,15 +174,8 @@ class VoroTracingTrainer:
             batch = self.ray_batcher.next_batch()
             ray_batch = batch["rays"]
             rgb_batch = batch["rgbs"]
-            alpha_batch = batch.get("alphas", torch.ones_like(rgb_batch[..., :1]))
 
-            need_contribution = (
-                self.config.contribution_weight > 0 or self.config.distortion_percell
-            )
-            rgba_output, _, contribution, _, errbox, distortion = self.model(
-                ray_batch,
-                return_contribution=need_contribution,
-            )
+            rgba_output, _, _, _, _, distortion = self.model(ray_batch)
 
             if rgba_output.ndim == 3:  # multiple rays per pixel, average over them
                 rgba_output = rgba_output.mean(dim=1)
@@ -204,17 +188,7 @@ class VoroTracingTrainer:
                 rgb_output = rgba_output[..., :3]
 
             color_loss = self.rgb_loss(rgb_batch, rgb_output)
-            opacity_loss = ((alpha_batch - opacity) ** 2).mean()
 
-            if self.config.contribution_weight > 0:
-                num_rays = ray_batch.reshape(-1, 6).shape[0]
-                contribution_loss = contribution.sum() / num_rays
-                w_contribution = self._contribution_weight(step)
-            else:
-                contribution_loss = torch.zeros((), device=self.device)
-                w_contribution = 0.0
-
-            gate_mean = 1.0  # per-cell distortion gate diagnostic (stays 1.0 when off)
             if self.config.distortion_weight > 0:
                 distortion_loss = distortion.mean()
                 # Half-time linear warmup: 0 at step 0, full weight
@@ -252,35 +226,11 @@ class VoroTracingTrainer:
                     )
                     self._warned_ssim_nopatch = True
 
-            loss = (
-                rgb_term
-                + opacity_loss
-                + w_contribution * contribution_loss
-                + w_distortion * distortion_loss
-            )
-
-            # Per-cell adaptive distortion: attach the per-ray residual (for the
-            # per-cell scatter) and the previous step's confidence gate to the errbox;
-            # the gradient split + gating happens inside TraceVoroTracing.backward.
-            percell_active = self.config.distortion_percell and w_distortion > 0
-            if percell_active:
-                ray_residual = color_loss.detach().mean(dim=-1).reshape(-1)  # [N]
-                errbox.ray_error = ray_residual.to(
-                    self.model.att_diffuse.dtype
-                ).contiguous()
-                errbox.cell_distortion_gate = getattr(self, "_cell_gate", None)
-                if errbox.cell_distortion_gate is not None:
-                    gate_mean = float(errbox.cell_distortion_gate.mean())
+            loss = rgb_term + w_distortion * distortion_loss
 
             self.optimizer.zero_grad(set_to_none=True)
 
             loss.backward()
-
-            if percell_active:
-                # Refresh the per-cell residual EMA -> next step's gate.
-                self._update_cell_residual(
-                    getattr(errbox, "point_error", None), contribution
-                )
 
             # Manual regularization gradients (avoids large intermediate allocations)
             if self.config.specular_reg_weight > 0 and hasattr(
@@ -289,18 +239,6 @@ class VoroTracingTrainer:
                 spec = self.model.att_specular
                 scale = 2.0 * self.config.specular_reg_weight / spec.numel()
                 spec.grad.add_(spec.data, alpha=scale)
-
-            if self.config.diffuse_tv_weight > 0 and hasattr(self.model, "att_diffuse"):
-                R = self.model.config.oct_map_res
-                diff = self.model.att_diffuse.data.reshape(-1, R, R, 3)
-                grad = self.model.att_diffuse.grad.reshape(-1, R, R, 3)
-                scale = 2.0 * self.config.diffuse_tv_weight / diff.numel()
-                dh = diff[:, 1:, :, :] - diff[:, :-1, :, :]
-                dw = diff[:, :, 1:, :] - diff[:, :, :-1, :]
-                grad[:, 1:, :, :].add_(dh, alpha=scale)
-                grad[:, :-1, :, :].add_(dh, alpha=-scale)
-                grad[:, :, 1:, :].add_(dw, alpha=scale)
-                grad[:, :, :-1, :].add_(dw, alpha=-scale)
 
             # Pull each diffuse texel toward its per-cell, per-channel mean.
             # Helps unseen-direction texels (which get no gradient from photometric
@@ -335,13 +273,9 @@ class VoroTracingTrainer:
                 if self.config.wandb:
                     log_dict = {
                         "train/rgb_loss": color_loss.mean(),
-                        "train/opacity_loss": opacity_loss.item(),
                         "train/num_points": self.model.primal_points.shape[0],
-                        "train/contribution_loss": contribution_loss.item(),
-                        "train/contribution_weight": w_contribution,
                         "train/distortion_loss": distortion_loss.item(),
                         "train/distortion_weight": w_distortion,
-                        "train/distortion_gate_mean": gate_mean,
                         "lr/points_lr": self.xyz_scheduler_args(step),
                         "lr/density_lr": self.den_scheduler_args(step),
                         "lr/attr_lr": self.attr_dc_scheduler_args(step),
@@ -352,15 +286,6 @@ class VoroTracingTrainer:
                         log_dict["train/specular_reg"] = (
                             (self.model.att_specular.detach() ** 2).mean().item()
                         )
-                    if self.config.diffuse_tv_weight > 0 and hasattr(
-                        self.model, "att_diffuse"
-                    ):
-                        R = self.model.config.oct_map_res
-                        d = self.model.att_diffuse.detach().reshape(-1, R, R, 3)
-                        log_dict["train/diffuse_tv"] = (
-                            (d[:, 1:] - d[:, :-1]).pow(2).mean()
-                            + (d[:, :, 1:] - d[:, :, :-1]).pow(2).mean()
-                        ).item()
                     if self.config.diffuse_mean_pull_weight > 0 and hasattr(
                         self.model, "att_diffuse"
                     ):
@@ -428,7 +353,7 @@ class VoroTracingTrainer:
 
             # Voronoi adjacency update
             if step - last_triangulation_update >= triangulation_update_period:
-                self.model.update_triangulation(incremental=True)
+                self.model.update_triangulation()
                 last_triangulation_update = step
 
                 if triangulation_update_period < 100:
@@ -485,50 +410,6 @@ class VoroTracingTrainer:
         config_dict["model"] = type(self.model).__name__
         with open(path, "w") as f:
             yaml.safe_dump(config_dict, f, sort_keys=False)
-
-    def _contribution_weight(self, step: int) -> float:
-        if self.config.contribution_weight <= 0:
-            return 0.0
-        t = min(max(step / max(self.config.iterations - 1, 1), 0.0), 1.0)
-        return self.config.contribution_weight * (1e-3**t)
-
-    def _update_cell_residual(self, point_error, contribution):
-        """Refresh the per-cell photometric-residual EMA and rebuild the per-cell
-        distortion confidence gate (Adaptive Shells analog).
-
-        point_error[i]   = Σ_rays weight_i * ray_residual   (scattered in backward)
-        contribution[i]  = Σ_rays weight_i                  (per-cell visible weight)
-        -> per-cell mean residual cr_i = point_error_i / contribution_i.
-        Gate g_i = exp(-ema_i / (beta * mean_ema)), normalized to mean 1 over seen
-        cells so the total binarization budget is conserved (only redistributed:
-        confident/low-residual cells get g>1, fuzzy/high-residual cells get g<1).
-        """
-        if point_error is None or contribution is None:
-            return
-        pe = point_error.detach().float().reshape(-1).clamp_min(0)
-        ct = contribution.detach().float().reshape(-1)
-        if pe.shape != ct.shape:
-            return
-        visible = ct > 1e-6
-        cr = torch.zeros_like(pe)
-        cr[visible] = pe[visible] / ct[visible]
-
-        decay = self.config.distortion_percell_decay
-        ema = getattr(self, "_cell_resid_ema", None)
-        if ema is None or ema.shape != cr.shape:
-            self._cell_resid_ema = cr.clone()
-        else:
-            ema[visible] = decay * ema[visible] + (1.0 - decay) * cr[visible]
-        ema = self._cell_resid_ema
-
-        seen = ema > 0
-        if not bool(seen.any()):
-            return
-        m = ema[seen].mean().clamp_min(1e-8)
-        beta = self.config.distortion_percell_beta
-        g = torch.exp(-ema / (beta * m))
-        g = g / g[seen].mean().clamp_min(1e-8)  # conserve total budget (mean 1)
-        self._cell_gate = g.clamp(0.0, 3.0)
 
     def _compute_metrics(self, rgb_output, rgb_batch):
         """Compute PSNR, SSIM and LPIPS for a single image pair (H, W, 3)."""
