@@ -52,30 +52,6 @@ _train_configs["vorotracing-indoor"].diffuse_mean_pull_weight = 1e-4
 _train_configs["vorotracing-indoor"].optimizer_config.specular_start = 0
 _train_configs["vorotracing-indoor"].dataset_config.scene = "bonsai"
 
-# Used in Deep Blending dataset: drjohnson, playroom
-_train_configs["vorotracing-db"] = deepcopy(_train_configs["vorotracing-indoor"])
-_train_configs["vorotracing-db"].iter2downsample = {0: 1}
-_train_configs["vorotracing-db"].specular_reg_weight = 1e-1
-_train_configs["vorotracing-db"].dataset_config.data_path = "data/db"
-_train_configs["vorotracing-db"].dataset_config.scene = "drjohnson"
-
-# Used in Tanks & Temples dataset: train, truck
-_train_configs["vorotracing-tandt"] = deepcopy(_train_configs["vorotracing-outdoor"])
-_train_configs["vorotracing-tandt"].iter2downsample = {0: 1}
-_train_configs["vorotracing-tandt"].specular_reg_weight = 5e-4
-_train_configs["vorotracing-tandt"].dataset_config.data_path = "data/tandt"
-_train_configs["vorotracing-tandt"].dataset_config.scene = "train"
-
-# Used in DL3DV dataset; we download the 2K resolution (1920x1080) and only have one image set
-_train_configs["vorotracing-dl3dv"] = deepcopy(_train_configs["vorotracing-indoor"])
-_train_configs["vorotracing-dl3dv"].iter2downsample = {0: 1}
-_train_configs["vorotracing-dl3dv"].dataset_config.data_path = "data/dl3dv"
-_train_configs[
-    "vorotracing-dl3dv"
-].dataset_config.scene = (
-    "41566d172f25ef7e3841ac4fbcbc83cace2df1614d699547051df02f567b8101"
-)
-
 TrainConfigList = (
     tyro.conf.SuppressFixed[
         tyro.extras.subcommand_type_from_defaults(defaults=_train_configs)
