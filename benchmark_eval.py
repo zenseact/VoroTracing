@@ -180,8 +180,7 @@ def benchmark_checkpoint(
 def infer_dataset_from_checkpoint(
     ckpt_path: Path, config_data: dict, fallback_dir: str, fallback_scene: str
 ) -> tuple[str, str]:
-    """Extract data_path and scene from the saved training config.
-    Remaps remote /proj/chalmers-cv/datasets/<name> paths to local data/<name>."""
+    """Extract data_path and scene from the saved training config."""
     ds_config = config_data.get("dataset_config", {})
     data_path = ds_config.get("data_path", fallback_dir)
     scene = ds_config.get("scene", fallback_scene)
