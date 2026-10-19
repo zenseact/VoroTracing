@@ -2,7 +2,7 @@
 
 _Differentiable Voronoi Ray Tracing Beyond Rasterization Speeds_
 
-[![Project Page](https://img.shields.io/badge/Project-Page-ffa)](https://research.zenseact.com/publications/vorotracing) [![arXiv Paper](https://img.shields.io/badge/arXiv-Paper-aff)](https://arxiv.org/abs/2608.17682) [![Web Viewer](https://img.shields.io/badge/Web-Viewer-afa)](https://research.zenseact.com/publications/vorotracing/viewer/)
+[![Project Page](https://img.shields.io/badge/Project-Page-ffa)](https://research.zenseact.com/publications/vorotracing) [![arXiv Paper](https://img.shields.io/badge/arXiv-Paper-aff)](https://arxiv.org/abs/2608.17682) [![Web Viewer](https://img.shields.io/badge/Web-Viewer-afa)](https://research.zenseact.com/publications/vorotracing/viewer/) [![Hugging Face Checkpoints](https://img.shields.io/badge/Hugging%20Face-Checkpoints-fda)](https://huggingface.co/bertaveira/vorotracing)
 
 VoroTracing is a differentiable Voronoi ray tracer for real-time novel view synthesis. Ray-based rendering expresses non-pinhole effects such as distortion, rolling shutter, and depth of field naturally, but is generally assumed too slow to compete with rasterization. We analyze the factors that govern throughput in differentiable Voronoi ray tracing (traversal length, per-cell work, and memory locality) and co-design the scene representation, the optimization, and the GPU execution around those costs.
 
@@ -54,6 +54,32 @@ data/mipnerf360/garden/sparse/0
 ```
 
 Downsampled image folders (`images_2`, `images_4`, `images_8`) are used directly: indoor scenes train at `images_2` and outdoor scenes at `images_4`. Every 8th image is held out as the test split, matching the standard Mip-NeRF 360 protocol.
+
+## Pretrained Checkpoints
+
+Checkpoints for the seven Mip-NeRF 360 scenes from the paper are available on [Hugging Face](https://huggingface.co/bertaveira/vorotracing). Download them from the repository root with the Hugging Face CLI (`uvx` runs it without installing anything):
+
+```bash
+# All seven scenes (~23.5 GB)
+uvx hf download bertaveira/vorotracing --include "checkpoints/*" --local-dir .
+
+# Or a single scene (~3.4 GB)
+uvx hf download bertaveira/vorotracing --include "checkpoints/mipnerf360/garden/*" --local-dir .
+```
+
+Each scene is saved to `checkpoints/mipnerf360/<scene>/` as `model.pt` together with its `config.yaml`.
+
+Evaluate the downloaded scenes (requires the dataset under `data/mipnerf360/`, see [Data](#data)):
+
+```bash
+uv run python benchmark_eval.py --base-dir checkpoints/mipnerf360
+```
+
+Or open one in the local viewer:
+
+```bash
+uv run python viewer.py --ckpt-dir checkpoints/mipnerf360/garden/model.pt
+```
 
 ## Train
 
